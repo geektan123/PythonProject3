@@ -5,11 +5,7 @@ langchain-community
 langchain-core
 langchain-google-genai
 typing-extensions
-tempfile
-json
-statistics
 PyPDF2
 pdf2image
 pytesseract
-datetime
 uvicorn
