@@ -10,3 +10,4 @@ pdf2image
 pytesseract
 uvicorn
 python-multipart  # Required for handling form data
+pypdf
