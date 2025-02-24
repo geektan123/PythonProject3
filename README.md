@@ -5,7 +5,7 @@ This API allows users to upload documents (PDF, JSON) and perform queries on the
 
 ## Base URL
 ```
-https://pythonproject-07i0.onrender.com
+https://pythonproject-07i0.onrender.com/docs
 ```
 
 ---
