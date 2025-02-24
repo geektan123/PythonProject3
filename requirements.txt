@@ -11,3 +11,4 @@ pytesseract
 uvicorn
 python-multipart  # Required for handling form data
 pypdf
+tesseract
