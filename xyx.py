@@ -1,22 +1,22 @@
-import chromadb
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader, TextLoader
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from typing import Optional, Dict, List
-import tempfile
-import json
-import statistics
+from langchain_community.vectorstores import Chroma
+from typing import List
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 import pytesseract
-from datetime import datetime
+import asyncio
+import shutil
+import tempfile
 
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(title="PDF Query AI Agent",
+              description="AI agent for querying uploaded PDF documents using Chroma vector storage")
 
 # Load environment variables
 load_dotenv()
@@ -24,261 +24,323 @@ api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("API key not found in .env file! Please add GOOGLE_API_KEY to your .env file.")
 
-# Initialize Chroma client
-chroma_client = chromadb.Client()
-collection_name = "documents"
-
-# Initialize Embeddings Model (shared across endpoints)
+# Initialize Embeddings Model
 embedding = GoogleGenerativeAIEmbeddings(
     model='models/text-embedding-004',
     google_api_key=api_key
 )
 
-# Supported file extensions
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".json", ".txt"}
+# Global variables
+chroma_db = None
+pdf_loaded = False
+current_pdf_path = None
 
 
-# Function to load documents based on file type
-def load_document(file_path: str, file_extension: str):
+class ChromaVectorStore:
+    """Chroma vector database interface for PDF documents"""
+
+    def __init__(self, persist_directory="./chroma_db"):
+        self.persist_directory = persist_directory
+        self.vectorstore = None
+
+    def initialize(self, documents: List[Document]):
+        """Initialize Chroma with documents"""
+        self.vectorstore = Chroma.from_documents(
+            documents=documents,
+            embedding=embedding,
+            persist_directory=self.persist_directory
+        )
+
+    async def similarity_search(self, query_embedding: List[float], k: int = 3) -> List[dict]:
+        """Search for similar documents in Chroma"""
+        results = self.vectorstore.similarity_search_by_vector(query_embedding, k=k)
+        return [
+            {
+                "content": doc.page_content,
+                "score": 1.0,  # Chroma doesn't return similarity scores by default
+                "metadata": doc.metadata
+            }
+            for doc in results
+        ]
+
+    def delete_all(self):
+        """Delete all documents from Chroma"""
+        if os.path.exists(self.persist_directory):
+            shutil.rmtree(self.persist_directory)
+        self.vectorstore = None
+
+
+def load_pdf_document(file_path: str) -> List[Document]:
+    """Load PDF document with OCR fallback"""
     try:
-        if file_extension == ".pdf":
-            reader = PdfReader(file_path)
-            if reader.is_encrypted:
-                raise ValueError("PDF is encrypted and cannot be processed without a password.")
-            if len(reader.pages) == 0:
-                raise ValueError("PDF has no pages.")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"PDF document not found at: {file_path}")
 
-            # Try PyPDFLoader first
-            loader = PyPDFLoader(file_path)
-            docs = loader.load()
-            if docs and any(doc.page_content.strip() for doc in docs):
-                return docs
+        reader = PdfReader(file_path)
+        if reader.is_encrypted:
+            raise ValueError("PDF is encrypted and cannot be processed without a password.")
+        if len(reader.pages) == 0:
+            raise ValueError("PDF has no pages.")
 
-            # If no text is extracted, fallback to OCR
-            try:
-                images = convert_from_path(file_path)
-                text = ""
-                for image in images:
-                    text += pytesseract.image_to_string(image) + "\n"
-                if not text.strip():
-                    raise ValueError("No text extracted via OCR. PDF may be empty or unreadable.")
-                return [Document(page_content=text, metadata={"source": file_path, "type": "pdf", "ocr_applied": True})]
-            except Exception as ocr_error:
-                raise ValueError(f"OCR processing failed: {str(ocr_error)}")
+        # Try PyPDFLoader first
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
 
-        elif file_extension == ".docx":
-            loader = UnstructuredWordDocumentLoader(file_path)
-        elif file_extension == ".txt":
-            loader = TextLoader(file_path)
-        elif file_extension == ".json":
-            with open(file_path, "r") as f:
-                raw_json = json.load(f)
-            return [Document(page_content=json.dumps(raw_json), metadata={"type": "json"})]
-        else:
-            raise ValueError(f"Unsupported file extension: {file_extension}")
-        return loader.load()
+        # Check if we got meaningful content
+        if docs and any(doc.page_content.strip() for doc in docs):
+            return docs
+
+        # If no text is extracted, fallback to OCR
+        print("No text extracted via standard PDF loader, attempting OCR...")
+        try:
+            images = convert_from_path(file_path)
+            text = ""
+            for i, image in enumerate(images):
+                page_text = pytesseract.image_to_string(image)
+                text += f"Page {i + 1}:\n{page_text}\n\n"
+
+            if not text.strip():
+                raise ValueError("No text extracted via OCR. PDF may be empty or unreadable.")
+
+            return [Document(
+                page_content=text,
+                metadata={"source": file_path, "type": "pdf", "ocr_applied": True}
+            )]
+        except Exception as ocr_error:
+            raise ValueError(f"OCR processing failed: {str(ocr_error)}")
+
     except Exception as e:
-        raise ValueError(f"Failed to load document: {str(e)}")
+        raise ValueError(f"Failed to load PDF document: {str(e)}")
 
 
-# Function to split documents (skip JSON)
-def split_documents(docs: List[Document]) -> List[Document]:
+def split_pdf_documents(docs: List[Document]) -> List[Document]:
+    """Split PDF documents into manageable chunks"""
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+        chunk_size=1500,
+        chunk_overlap=300,
         length_function=len,
         is_separator_regex=False,
+        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
     )
-    split_docs = []
-    for doc in docs:
-        if doc.metadata.get("type") == "json":
-            split_docs.append(doc)
-        else:
-            split_docs.extend(text_splitter.split_documents([doc]))
-    return split_docs
+    return text_splitter.split_documents(docs)
 
 
-# Function to extract values from JSON data for aggregation (handles all types)
-def extract_values(json_data: List[Dict], field: str) -> tuple:
-    values = []
-    field_type = None
+async def initialize_pdf(file_path: str):
+    """Initialize the PDF document in Chroma"""
+    global pdf_loaded, chroma_db, current_pdf_path
 
-    for item in json_data:
-        try:
-            value = item[field]
-            if value is None:
-                continue
-
-            if field_type is None:
-                if isinstance(value, (int, float)):
-                    field_type = "numerical"
-                elif isinstance(value, str):
-                    try:
-                        datetime.strptime(value, "%Y-%m-%d")
-                        field_type = "date"
-                    except ValueError:
-                        field_type = "string"
-                else:
-                    field_type = "string"
-
-            if field_type == "numerical":
-                values.append(float(value))
-            elif field_type == "date":
-                values.append(datetime.strptime(value, "%Y-%m-%d"))
-            elif field_type == "string":
-                values.append(str(value))
-        except KeyError:
-            continue
-
-    if not values:
-        raise ValueError(f"No valid values found for field '{field}' in the JSON data.")
-
-    return values, field_type
-
-
-# Endpoint 1: Upload and process document
-@app.post("/upload-document/")
-async def upload_document(file: UploadFile = File(...)):
-    file_extension = os.path.splitext(file.filename)[1].lower()
-    if file_extension not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail=f"Only {', '.join(SUPPORTED_EXTENSIONS)} files are supported!")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-        temp_file.write(await file.read())
-        file_path = temp_file.name
+    if pdf_loaded and current_pdf_path == file_path:
+        return
 
     try:
-        docs = load_document(file_path, file_extension)
-        docs = split_documents(docs)
+        # Initialize Chroma vector store
+        chroma_db = ChromaVectorStore()
 
-        if not docs:
-            raise HTTPException(status_code=400, detail="No content could be extracted from the document!")
+        print("Loading PDF document...")
+        docs = load_pdf_document(file_path)
+        print(f"Loaded {len(docs)} pages from PDF")
 
-        doc_texts = [doc.page_content for doc in docs]
-        doc_embeddings = embedding.embed_documents(doc_texts)
+        # Split documents
+        split_docs = split_pdf_documents(docs)
+        print(f"Split into {len(split_docs)} chunks")
 
-        try:
-            chroma_client.delete_collection(collection_name)
-        except:
-            pass
-        collection = chroma_client.create_collection(collection_name)
+        if not split_docs:
+            raise ValueError("No content could be extracted from the PDF document!")
 
-        collection.add(
-            embeddings=doc_embeddings,
-            documents=doc_texts,
-            metadatas=[{"type": doc.metadata.get("type", "text"), "ocr_applied": doc.metadata.get("ocr_applied", False)}
-                       for doc in docs],
-            ids=[f"doc_{i}" for i in range(len(doc_texts))]
-        )
+        # Store in Chroma
+        print("Storing embeddings in Chroma...")
+        chroma_db.initialize(split_docs)
 
-        return {"message": "Document processed and embeddings stored successfully", "chunk_count": len(doc_texts)}
+        pdf_loaded = True
+        current_pdf_path = file_path
+        print(f"Successfully loaded PDF document with {len(split_docs)} chunks to Chroma")
 
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+        raise RuntimeError(f"Failed to initialize PDF document: {str(e)}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Startup event (no default PDF loading)"""
+    pass
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with information about the PDF Query AI Agent"""
+    return {
+        "message": "PDF Query AI Agent",
+        "description": "Ask questions about uploaded PDF documents",
+        "vector_database": "Chroma",
+        "endpoints": {
+            "/upload-pdf/": "POST - Upload a PDF document",
+            "/ask-pdf/": "POST - Ask a question about the uploaded PDF",
+            "/health/": "GET - Check system health",
+            "/reinitialize-pdf/": "POST - Reinitialize PDF document"
+        },
+        "pdf_loaded": pdf_loaded
+    }
+
+
+@app.get("/health/")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy" if pdf_loaded else "no_pdf_loaded",
+        "pdf_loaded": pdf_loaded,
+        "vector_database": "Chroma",
+        "chroma_connected": chroma_db is not None
+    }
+
+
+@app.post("/upload-pdf/")
+async def upload_pdf(file: UploadFile = File(...)):
+    """Upload a PDF document to be processed"""
+    global pdf_loaded, current_pdf_path
+
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    try:
+        # Save the uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+            temp_file.write(await file.read())
+            temp_file_path = temp_file.name
+
+        # Reinitialize with the new PDF
+        if chroma_db:
+            chroma_db.delete_all()
+        pdf_loaded = False
+        await initialize_pdf(temp_file_path)
+
+        return {
+            "message": "PDF successfully uploaded and processed",
+            "filename": file.filename,
+            "status": "success",
+            "vector_database": "Chroma"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # Clean up temporary file
+        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
 
 
-# Endpoint 2: Query non-JSON documents (PDF, DOCX, TXT)
-@app.post("/query-document/")
-async def query_document(query: str = Form(...)):
-    try:
-        collection = chroma_client.get_collection(collection_name)
-    except:
-        raise HTTPException(status_code=404,
-                            detail="No document has been uploaded yet. Please upload a document first.")
-
-    # Check if the document is JSON
-    results = collection.get(include=["metadatas"])
-    is_json = any(meta.get("type") == "json" for meta in results["metadatas"])
-    if is_json:
-        raise HTTPException(status_code=400,
-                            detail="This endpoint is for non-JSON documents only. Use /query-json/ for JSON documents.")
-
-    try:
-        query_embedding = embedding.embed_query(query)
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=1
+@app.post("/ask-pdf/")
+async def ask_pdf(question: str = Form(..., description="Your question about the uploaded PDF")):
+    """Ask a question about the uploaded PDF document"""
+    if not pdf_loaded or not chroma_db:
+        raise HTTPException(
+            status_code=503,
+            detail="No PDF document loaded. Please upload a PDF first."
         )
 
-        most_similar_text = results['documents'][0][0]
-        similarity_score = 1 - results['distances'][0][0]
+    try:
+        # Generate query embedding
+        query_embedding = embedding.embed_query(question)
 
+        # Search for relevant context in Chroma
+        results = await chroma_db.similarity_search(query_embedding, k=3)
+
+        if not results:
+            raise HTTPException(
+                status_code=404,
+                detail="No relevant context found in the uploaded PDF for your question."
+            )
+
+        # Process results
+        contexts = [
+            {
+                "text": result["content"],
+                "similarity_score": result["score"],
+                "metadata": result["metadata"],
+                "rank": i + 1
+            }
+            for i, result in enumerate(results)
+        ]
+
+        # Use the most relevant context for the primary response
+        primary_context = contexts[0]
+
+        # Generate response using LLM
         llm = ChatGoogleGenerativeAI(
-            model="gemini-pro",
-            google_api_key=api_key
+            model="gemini-2.0-flash",
+            google_api_key=api_key,
+            temperature=0.1
         )
-        prompt = (
-            f"Context: I have analyzed a stored document. "
-            f"The most relevant chunk to the query '{query}' is: '{most_similar_text}' "
-            f"(similarity score: {similarity_score:.4f}). Based on this, provide a clear and concise answer to the query."
-        )
+
+        # Create comprehensive prompt
+        context_text = "\n\n---\n\n".join([ctx["text"] for ctx in contexts])
+
+        prompt = f"""You are a PDF Query AI agent with access to an uploaded PDF document.
+
+QUESTION: {question}
+
+RELEVANT PDF CONTEXT:
+{context_text}
+
+INSTRUCTIONS:
+1. Answer the question based ONLY on the provided PDF context
+2. Be precise and cite specific sections when possible
+3. If the context doesn't fully answer the question, clearly state the limitations
+4. Use clear, professional language
+5. Do not make assumptions or provide information not found in the context
+6. If multiple interpretations are possible, acknowledge this
+
+Provide a comprehensive answer based on the PDF context provided."""
+
         response = llm.invoke(prompt)
-        gemini_answer = response.content
+        answer = response.content
+
+        # Determine confidence level (using a placeholder since Chroma doesn't provide scores)
+        confidence = "medium"  # Chroma doesn't return similarity scores, so we use a default
 
         return {
-            "query": query,
-            "most_similar_chunk": most_similar_text,
-            "similarity_score": float(similarity_score),
-            "answer": gemini_answer
+            "question": question,
+            "answer": answer,
+            "confidence": confidence,
+            "vector_database": "Chroma",
+            "primary_context": {
+                "text": primary_context["text"][:500] + "..." if len(primary_context["text"]) > 500 else
+                primary_context["text"],
+                "similarity_score": primary_context["similarity_score"]
+            },
+            "additional_contexts": [
+                {
+                    "text": ctx["text"][:200] + "..." if len(ctx["text"]) > 200 else ctx["text"],
+                    "similarity_score": ctx["similarity_score"],
+                    "rank": ctx["rank"]
+                } for ctx in contexts[1:]
+            ],
+            "disclaimer": "This response is based on the uploaded PDF and should not be considered as professional advice. Consult a qualified professional for specific situations."
         }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
 
 
-# Endpoint 3: Query JSON documents (supports all field types)
-@app.post("/query-json/")
-async def query_json(
-        operation: str = Form(..., description="Operation: max, min, sum, avg"),
-        field: str = Form(..., description="Field name to aggregate")
-):
+@app.post("/reinitialize-pdf/")
+async def reinitialize_pdf():
+    """Reinitialize the current PDF document (useful for updates or troubleshooting)"""
+    global pdf_loaded
+
     try:
-        collection = chroma_client.get_collection(collection_name)
-        results = collection.get(include=["documents", "metadatas"])
-        json_docs = [doc for doc, meta in zip(results["documents"], results["metadatas"]) if meta.get("type") == "json"]
+        if not current_pdf_path:
+            raise HTTPException(status_code=400, detail="No PDF currently loaded")
 
-        if not json_docs:
-            raise HTTPException(status_code=404,
-                                detail="No JSON data has been uploaded yet. Please upload a JSON file first.")
+        if chroma_db:
+            chroma_db.delete_all()
 
-        json_data = []
-        for doc in json_docs:
-            json_data.extend(json.loads(doc))
-
-        values, field_type = extract_values(json_data, field)
-
-        if operation in ("max", "min"):
-            result = max(values) if operation == "max" else min(values)
-            if field_type == "date":
-                result = result.strftime("%Y-%m-%d")
-            elif field_type == "numerical":
-                result = float(result)
-            else:
-                result = str(result)
-        elif field_type == "numerical" and operation == "sum":
-            result = float(sum(values))
-        elif field_type == "numerical" and operation == "avg":
-            result = float(statistics.mean(values))
-        else:
-            raise HTTPException(status_code=400,
-                                detail=f"Operation '{operation}' is not supported for {field_type} field '{field}'. "
-                                       "Use 'max' or 'min' for strings/dates, and 'max', 'min', 'sum', or 'avg' for numbers.")
-
+        pdf_loaded = False
+        await initialize_pdf(current_pdf_path)
         return {
-            "operation": operation,
-            "field": field,
-            "field_type": field_type,
-            "result": result,
-            "value_count": len(values)
+            "message": "PDF document successfully reinitialized",
+            "status": "success",
+            "vector_database": "Chroma"
         }
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing JSON query: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to reinitialize PDF: {str(e)}")
 
 
 # Run the app
