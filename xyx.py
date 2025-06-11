@@ -27,7 +27,14 @@ embedding = GoogleGenerativeAIEmbeddings(
     model='models/text-embedding-004',
     google_api_key=api_key
 )
-
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Global variables for in-memory storage
 documents = []
 embeddings = []
