@@ -1,11 +1,11 @@
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_community.vectorstores import Chroma
 from typing import List
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
@@ -13,10 +13,21 @@ import pytesseract
 import asyncio
 import shutil
 import tempfile
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Initialize FastAPI app
 app = FastAPI(title="PDF Query AI Agent",
-              description="AI agent for querying uploaded PDF documents using Chroma vector storage")
+              description="AI agent for querying uploaded PDF documents using in-memory storage")
+
+# Set up CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load environment variables
 load_dotenv()
@@ -31,44 +42,10 @@ embedding = GoogleGenerativeAIEmbeddings(
 )
 
 # Global variables
-chroma_db = None
 pdf_loaded = False
 current_pdf_path = None
-
-
-class ChromaVectorStore:
-    """Chroma vector database interface for PDF documents"""
-
-    def __init__(self, persist_directory="./chroma_db"):
-        self.persist_directory = persist_directory
-        self.vectorstore = None
-
-    def initialize(self, documents: List[Document]):
-        """Initialize Chroma with documents"""
-        self.vectorstore = Chroma.from_documents(
-            documents=documents,
-            embedding=embedding,
-            persist_directory=self.persist_directory
-        )
-
-    async def similarity_search(self, query_embedding: List[float], k: int = 3) -> List[dict]:
-        """Search for similar documents in Chroma"""
-        results = self.vectorstore.similarity_search_by_vector(query_embedding, k=k)
-        return [
-            {
-                "content": doc.page_content,
-                "score": 1.0,  # Chroma doesn't return similarity scores by default
-                "metadata": doc.metadata
-            }
-            for doc in results
-        ]
-
-    def delete_all(self):
-        """Delete all documents from Chroma"""
-        if os.path.exists(self.persist_directory):
-            shutil.rmtree(self.persist_directory)
-        self.vectorstore = None
-
+document_chunks = []  # Store document chunks
+document_embeddings = []  # Store corresponding embeddings
 
 def load_pdf_document(file_path: str) -> List[Document]:
     """Load PDF document with OCR fallback"""
@@ -112,7 +89,6 @@ def load_pdf_document(file_path: str) -> List[Document]:
     except Exception as e:
         raise ValueError(f"Failed to load PDF document: {str(e)}")
 
-
 def split_pdf_documents(docs: List[Document]) -> List[Document]:
     """Split PDF documents into manageable chunks"""
     text_splitter = RecursiveCharacterTextSplitter(
@@ -124,17 +100,17 @@ def split_pdf_documents(docs: List[Document]) -> List[Document]:
     )
     return text_splitter.split_documents(docs)
 
-
 async def initialize_pdf(file_path: str):
-    """Initialize the PDF document in Chroma"""
-    global pdf_loaded, chroma_db, current_pdf_path
+    """Initialize the PDF document in memory"""
+    global pdf_loaded, current_pdf_path, document_chunks, document_embeddings
 
     if pdf_loaded and current_pdf_path == file_path:
         return
 
     try:
-        # Initialize Chroma vector store
-        chroma_db = ChromaVectorStore()
+        # Clear existing data
+        document_chunks = []
+        document_embeddings = []
 
         print("Loading PDF document...")
         docs = load_pdf_document(file_path)
@@ -147,23 +123,47 @@ async def initialize_pdf(file_path: str):
         if not split_docs:
             raise ValueError("No content could be extracted from the PDF document!")
 
-        # Store in Chroma
-        print("Storing embeddings in Chroma...")
-        chroma_db.initialize(split_docs)
+        # Generate embeddings for each chunk
+        print("Generating embeddings for document chunks...")
+        document_chunks = split_docs
+        document_embeddings = embedding.embed_documents([doc.page_content for doc in split_docs])
 
         pdf_loaded = True
         current_pdf_path = file_path
-        print(f"Successfully loaded PDF document with {len(split_docs)} chunks to Chroma")
+        print(f"Successfully loaded PDF document with {len(split_docs)} chunks in memory")
 
     except Exception as e:
         raise RuntimeError(f"Failed to initialize PDF document: {str(e)}")
 
+async def similarity_search(query_embedding: List[float], k: int = 3) -> List[dict]:
+    """Perform similarity search using cosine similarity"""
+    if not document_embeddings:
+        return []
+
+    # Convert embeddings to numpy arrays for cosine similarity calculation
+    query_embedding = np.array(query_embedding).reshape(1, -1)
+    doc_embeddings = np.array(document_embeddings)
+
+    # Calculate cosine similarities
+    similarities = cosine_similarity(query_embedding, doc_embeddings)[0]
+
+    # Get top k indices and scores
+    top_k_indices = np.argsort(similarities)[::-1][:k]
+    results = [
+        {
+            "content": document_chunks[idx].page_content,
+            "score": float(similarities[idx]),
+            "metadata": document_chunks[idx].metadata
+        }
+        for idx in top_k_indices
+    ]
+
+    return results
 
 @app.on_event("startup")
 async def startup_event():
     """Startup event (no default PDF loading)"""
     pass
-
 
 @app.get("/")
 async def root():
@@ -171,7 +171,7 @@ async def root():
     return {
         "message": "PDF Query AI Agent",
         "description": "Ask questions about uploaded PDF documents",
-        "vector_database": "Chroma",
+        "storage": "In-memory",
         "endpoints": {
             "/upload-pdf/": "POST - Upload a PDF document",
             "/ask-pdf/": "POST - Ask a question about the uploaded PDF",
@@ -181,22 +181,20 @@ async def root():
         "pdf_loaded": pdf_loaded
     }
 
-
 @app.get("/health/")
 async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy" if pdf_loaded else "no_pdf_loaded",
         "pdf_loaded": pdf_loaded,
-        "vector_database": "Chroma",
-        "chroma_connected": chroma_db is not None
+        "storage": "In-memory",
+        "chunks_stored": len(document_chunks)
     }
-
 
 @app.post("/upload-pdf/")
 async def upload_pdf(file: UploadFile = File(...)):
     """Upload a PDF document to be processed"""
-    global pdf_loaded, current_pdf_path
+    global pdf_loaded, current_pdf_path, document_chunks, document_embeddings
 
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -207,9 +205,9 @@ async def upload_pdf(file: UploadFile = File(...)):
             temp_file.write(await file.read())
             temp_file_path = temp_file.name
 
-        # Reinitialize with the new PDF
-        if chroma_db:
-            chroma_db.delete_all()
+        # Clear existing data and reinitialize with the new PDF
+        document_chunks = []
+        document_embeddings = []
         pdf_loaded = False
         await initialize_pdf(temp_file_path)
 
@@ -217,7 +215,7 @@ async def upload_pdf(file: UploadFile = File(...)):
             "message": "PDF successfully uploaded and processed",
             "filename": file.filename,
             "status": "success",
-            "vector_database": "Chroma"
+            "storage": "In-memory"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
@@ -226,11 +224,10 @@ async def upload_pdf(file: UploadFile = File(...)):
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
             os.unlink(temp_file_path)
 
-
 @app.post("/ask-pdf/")
 async def ask_pdf(question: str = Form(..., description="Your question about the uploaded PDF")):
     """Ask a question about the uploaded PDF document"""
-    if not pdf_loaded or not chroma_db:
+    if not pdf_loaded or not document_chunks:
         raise HTTPException(
             status_code=503,
             detail="No PDF document loaded. Please upload a PDF first."
@@ -240,8 +237,8 @@ async def ask_pdf(question: str = Form(..., description="Your question about the
         # Generate query embedding
         query_embedding = embedding.embed_query(question)
 
-        # Search for relevant context in Chroma
-        results = await chroma_db.similarity_search(query_embedding, k=3)
+        # Search for relevant context
+        results = await similarity_search(query_embedding, k=3)
 
         if not results:
             raise HTTPException(
@@ -293,17 +290,16 @@ Provide a comprehensive answer based on the PDF context provided."""
         response = llm.invoke(prompt)
         answer = response.content
 
-        # Determine confidence level (using a placeholder since Chroma doesn't provide scores)
-        confidence = "medium"  # Chroma doesn't return similarity scores, so we use a default
+        # Determine confidence level based on similarity score
+        confidence = "high" if primary_context["similarity_score"] > 0.8 else "medium" if primary_context["similarity_score"] > 0.5 else "low"
 
         return {
             "question": question,
             "answer": answer,
             "confidence": confidence,
-            "vector_database": "Chroma",
+            "storage": "In-memory",
             "primary_context": {
-                "text": primary_context["text"][:500] + "..." if len(primary_context["text"]) > 500 else
-                primary_context["text"],
+                "text": primary_context["text"][:500] + "..." if len(primary_context["text"]) > 500 else primary_context["text"],
                 "similarity_score": primary_context["similarity_score"]
             },
             "additional_contexts": [
@@ -319,7 +315,6 @@ Provide a comprehensive answer based on the PDF context provided."""
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
 
-
 @app.post("/reinitialize-pdf/")
 async def reinitialize_pdf():
     """Reinitialize the current PDF document (useful for updates or troubleshooting)"""
@@ -329,22 +324,22 @@ async def reinitialize_pdf():
         if not current_pdf_path:
             raise HTTPException(status_code=400, detail="No PDF currently loaded")
 
-        if chroma_db:
-            chroma_db.delete_all()
+        # Clear existing data
+        global document_chunks, document_embeddings
+        document_chunks = []
+        document_embeddings = []
 
         pdf_loaded = False
         await initialize_pdf(current_pdf_path)
         return {
             "message": "PDF document successfully reinitialized",
             "status": "success",
-            "vector_database": "Chroma"
+            "storage": "In-memory"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to reinitialize PDF: {str(e)}")
 
-
 # Run the app
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8001)
