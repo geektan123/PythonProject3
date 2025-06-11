@@ -1,14 +1,26 @@
-chromadb
-fastapi
-python-dotenv
-langchain-community
+# LangChain Core
+langchain
 langchain-core
+
+# OpenAI Integration
+langchain-openai
+openai
+
+# Anthropic Integration
+langchain-anthropic
+
+# Google Gemini (PaLM) Integration
 langchain-google-genai
-typing-extensions
-PyPDF2
-pdf2image
-pytesseract
-uvicorn
-python-multipart  # Required for handling form data
-pypdf
-tesseract
+google-generativeai
+
+# Hugging Face Integration
+langchain-huggingface
+transformers
+huggingface-hub
+
+# Environment Variable Management
+python-dotenv
+
+# Machine Learning Utilities
+numpy
+scikit-learn
